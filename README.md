@@ -1,25 +1,25 @@
-In-development, an injectable DLL which adds custom additions to the Gunfight OSP Blueprints mode of Modern Warfare 2019.
-Tested on version 1.41 with IW8-Mod odin/v3.0.0-milestone2_public-beta
+In-development, an injectable DLL which adds custom additions to the Gunfight OSP Blueprints mode of Modern Warfare 2019.#
+Tested on version 1.41 with IW8-Mod odin/v3.0.0-milestone2_public-beta#
+#
+What this currently does:#
+  -Adds T9 (Cold War) snipers to the "Random Snipers" custom games option within OSP Gunfight modes#
+  -Player will now spawn with Fists instead of no secondary in Gunfight OSP Blueprints#
+  -Blueprint pool for OSP Blueprints is slightly expanded (Will expand more in the future)#
+#
+How to use:#
+  Open MW2019/IW8-Mod, navigate to custom games, set up your gunfight match and game settings, etc.#
+  Take your DLL and inject it. The injector I use myself for 1.41 is https://github.com/raminkarimkhani1996/DLLInjector/tree/master#
+  Start your match, and enjoy#
 
-What this currently does:
-  -Adds T9 (Cold War) snipers to the "Random Snipers" custom games option within OSP Gunfight modes
-  -Player will now spawn with Fists instead of no secondary in Gunfight OSP Blueprints
-  -Blueprint pool for OSP Blueprints is slightly expanded (Will expand more in the future)
-
-How to use:
-  Open MW2019/IW8-Mod, navigate to custom games, set up your gunfight match and game settings, etc.
-  Take your DLL and inject it. The injector I use myself for 1.41 is https://github.com/raminkarimkhani1996/DLLInjector/tree/master
-  Start your match, and enjoy
-
-Plans for the future:
-  -Get attachments from Gunfight OSP Classtable for use ingame
-  -Fill OSP Classtable with all current blueprints available
-  -Add remaining T9/Misc weapons to their categories under Gunfight OSP
-
+Plans for the future:#
+  -Get attachments from Gunfight OSP Classtable for use ingame#
+  -Fill OSP Classtable with all current blueprints available#
+  -Add remaining T9/Misc weapons to their categories under Gunfight OSP#
+#
   
 
-Made with ChatGPT's Codex Software.
-AI's Notes below:
+Made with ChatGPT's Codex Software.#
+AI's Notes below:#
 # IW8 sidecar - OSP Blueprints full sniper package
 
 Expected build ID:
