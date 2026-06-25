@@ -3,8 +3,11 @@
 
 # What this currently does:
  - Adds T9 (Cold War) snipers to the "Random Snipers" custom games option within OSP Gunfight modes
-  - Player will now spawn with Fists instead of no secondary in Gunfight OSP Blueprints
-  - Blueprint pool for OSP Blueprints is slightly expanded (Will expand more in the future)
+ - Player will now spawn with Fists instead of no secondary in Gunfight OSP Blueprints
+ - Blueprint pool for OSP Blueprints is slightly expanded (Will expand more in the future)
+
+<img width="1920" height="1080" alt="Capture" src="https://github.com/user-attachments/assets/17893b08-038d-43ac-a204-566801b9a00d" />
+
 
 # How to use:
 - Open MW2019/IW8-Mod, navigate to custom games, set up your gunfight match and game settings, etc.
