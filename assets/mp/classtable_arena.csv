@@ -1,0 +1,33 @@
+<column 0>,<column 1>,<column 2>,<column 3>,<column 4>,<column 5>,<column 6>,<column 7>,<column 8>,<column 9>,<column 10>,<column 11>,<column 12>
+loadoutName,LW3 - Tundra (CW),ZRG 20mm (CW),Pelington 703 (CW),HDR (MW),Rytec AMR (MW),AX-50 (MW),SP-R 208 (MW),Swiss K31 (CW),M82 (CW),Kar98k (MW),Mk2 Carbine (MW),Dragunov (MW)
+loadoutPrimaryAddBlueprintAttachments,0,0,0,0,0,0,0,0,0,0,0,0
+loadoutPrimary,iw8_sn_t9standard,iw8_sn_t9cannon,iw8_sn_t9quickscope,iw8_sn_hdromeo,iw8_sn_xmike109,iw8_sn_alpha50,iw8_sn_romeo700,iw8_sn_t9accurate,iw8_sn_t9powersemi,iw8_sn_kilo98,iw8_sn_sbeta,iw8_sn_delta
+loadoutPrimaryAttachment1,thermal2,thermal2,thermal2,thermal2,thermal2,thermal2,thermal2,thermal2,thermal2,thermal2,thermal2,thermal2
+loadoutPrimaryAttachment2,barlong,barlong,barlong,barlong,barlong,barlong,barlong,barlong,barlong,barlong,barlong,barlong
+loadoutPrimaryAttachment3,stockh,stockh,stockh,stockh,stockh,stockh,stockh,stockh,stockh,stockh,stockh,stockh
+loadoutPrimaryAttachment4,pistolgrip02,pistolgrip02,pistolgrip02,pistolgrip02,pistolgrip02,pistolgrip02,gripcust,pistolgrip02,pistolgrip02,pistolgrip02,pistolgrip02,pistolgrip02
+loadoutPrimaryAttachment5,xmagslrg,xmagslrg,xmagslrg,xmagslrg,calcust2,xmagslrg,xmags,xmagslrg,xmagslrg,xmags,silencer3,xmagslrg
+loadoutPrimaryCamo,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutPrimaryReticle,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutPrimaryVariantID,0 1,0 1,0 1,1 3 5 6 7 8 9 10,1,1 3 4 5 6 7 8 9 10 11,1,0 1,0 1,1 2 3 4 5 6 7 8 9 10,2 3 4 5 6 7 8 10 11 12 13,2 3 4 5 6 7 8 9
+loadoutSecondaryAddBlueprintAttachments,0,0,0,0,0,0,0,0,0,0,0,0
+loadoutSecondary,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryAttachment1,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryAttachment2,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryAttachment3,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryAttachment4,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryAttachment5,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryCamo,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryReticle,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutSecondaryVariantID,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+loadoutEquipmentPrimary,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutExtraPowerPrimary,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutEquipmentSecondary,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutExtraPowerSecondary,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutPerk1,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix,specialty_quickfix
+loadoutPerk2,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline,specialty_hardline
+loadoutPerk3,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp,specialty_amp
+loadoutExtraPerk1,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutExtraPerk2,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutExtraPerk3,none,none,none,none,none,none,none,none,none,none,none,none
+loadoutOverkill,0,0,0,0,0,0,0,0,0,0,0,0
