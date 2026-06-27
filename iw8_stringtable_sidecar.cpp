@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -42,6 +43,10 @@ namespace iw8st {
 
 constexpr std::uintptr_t DB_FIND_XASSETHEADER_CALLSITE_RVA_141 = 0x327B578; // ModernWarfare.exe.json key EB6CDC20 match RVA; signature uses Add(1).Rip() to reach the real function
 constexpr int ASSET_TYPE_STRINGTABLE = 0x36;
+constexpr bool kEnableFileProbeHooks = false;
+constexpr bool kEnableAttachmentMapScopeRedirect = false;
+constexpr bool kEnableAttachmentMapCsvScopeRedirect = true;
+constexpr const char* kBuildId = "OVERLAY_CYCLIC_EXPANDED_POOL_OSP_BLUEPRINT_GUNSMITH_ATTACH_TAKEFISTS_MEMPATCH_OSP_ROWS_EXACT_PERF_CACHE_BLUEPRINT_STATSTABLE_CSV_EXTRAS_ATTACHMENTMAP_CSV_SCOPE_BUILD_ID 2026-06-26";
 
 struct StringTable {
     const char* name;           // 0x00
@@ -73,6 +78,16 @@ struct BlueprintAttachmentPatch {
 
 using BlueprintAttachmentMap = std::unordered_map<std::string, std::vector<BlueprintAttachmentPatch>>;
 
+void addSyntheticT9ThermalAttachmentPatches(BlueprintAttachmentMap& out, int* patchCount);
+
+struct ExtraBlueprintColumn {
+    std::string loadoutName;
+    std::string primaryRoot;
+    std::string primaryVariantIds;
+    int sourceVariantRows{};
+    int scopedVariantRows{};
+};
+
 struct OwnedTable {
     std::string assetName;
     std::vector<std::string> stringStorage;
@@ -81,6 +96,26 @@ struct OwnedTable {
     std::vector<std::uint16_t> cellIndices;
     fs::file_time_type lastWrite{};
     StringTable* target{};
+};
+
+struct CachedCsvEntry {
+    fs::file_time_type lastWrite{};
+    std::shared_ptr<CsvTable> table;
+};
+
+struct CachedExtraPoolEntry {
+    fs::path path;
+    fs::file_time_type lastWrite{};
+    std::vector<std::string> values;
+    bool valid{};
+};
+
+struct CachedBlueprintAttachmentEntry {
+    std::string pathKey;
+    fs::file_time_type lastWrite{};
+    BlueprintAttachmentMap patchesByRoot;
+    int patchCount{};
+    bool valid{};
 };
 
 static HMODULE g_module{};
@@ -95,7 +130,11 @@ static std::unordered_map<std::string, bool> g_loggedInvalidShapeByAsset;
 static std::unordered_map<std::string, bool> g_loggedFallbackByAsset;
 static std::unordered_map<std::string, bool> g_loggedScriptProbeByAsset;
 static std::unordered_map<std::string, bool> g_loggedFileProbeByPath;
+static std::unordered_map<std::string, CachedCsvEntry> g_csvCache;
 static std::vector<std::unique_ptr<OwnedTable>> g_ownedPool;
+static CachedExtraPoolEntry g_extraPoolCache;
+static CachedBlueprintAttachmentEntry g_blueprintAttachmentCache;
+static const std::vector<std::string> g_emptyStringVector{};
 static wchar_t g_logPath[MAX_PATH]{};
 static fs::path g_sidecarDir;
 static fs::path g_gameRoot;
@@ -520,13 +559,17 @@ int scanTakefistsRegion(const MEMORY_BASIC_INFORMATION& mbi, TakefistsScanStats&
     return patched;
 }
 
-int scanAndPatchTakefistsOnce(int pass) {
+int scanAndPatchTakefistsOnce(int pass, bool fullScan) {
     static constexpr std::size_t maxRegionSize = 64ull * 1024ull * 1024ull;
+    static constexpr std::size_t priorityMinRegionSize = 4ull * 1024ull * 1024ull;
+    static constexpr std::size_t priorityMaxRegionSize = 8ull * 1024ull * 1024ull;
 
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
 
     TakefistsScanStats stats{};
+    std::vector<MEMORY_BASIC_INFORMATION> priorityRegions{};
+    std::vector<MEMORY_BASIC_INFORMATION> fallbackRegions{};
     auto address = reinterpret_cast<std::uintptr_t>(info.lpMinimumApplicationAddress);
     const auto maxAddress = reinterpret_cast<std::uintptr_t>(info.lpMaximumApplicationAddress);
 
@@ -547,9 +590,11 @@ int scanAndPatchTakefistsOnce(int pass) {
 
         if (scanRegion) {
             if (mbi.RegionSize <= maxRegionSize) {
-                ++stats.scannedRegions;
-                stats.scannedBytes += static_cast<std::uint64_t>(mbi.RegionSize);
-                scanTakefistsRegion(mbi, stats);
+                if (mbi.RegionSize >= priorityMinRegionSize && mbi.RegionSize <= priorityMaxRegionSize) {
+                    priorityRegions.push_back(mbi);
+                } else {
+                    fallbackRegions.push_back(mbi);
+                }
             } else {
                 ++stats.skippedLargeRegions;
             }
@@ -558,13 +603,32 @@ int scanAndPatchTakefistsOnce(int pass) {
         address = regionEnd;
     }
 
-    log("Takefists memory patch pass %d: patched=%d scannedRegions=%llu scannedMB=%llu skippedLargeRegions=%llu readFailures=%llu",
+    auto scanRegions = [&](const std::vector<MEMORY_BASIC_INFORMATION>& regions) {
+        for (const auto& region : regions) {
+            ++stats.scannedRegions;
+            stats.scannedBytes += static_cast<std::uint64_t>(region.RegionSize);
+            scanTakefistsRegion(region, stats);
+            if (stats.patched >= 2) {
+                break;
+            }
+        }
+    };
+
+    scanRegions(priorityRegions);
+    if (fullScan && stats.patched < 2) {
+        scanRegions(fallbackRegions);
+    }
+
+    log("Takefists memory patch pass %d (%s): patched=%d scannedRegions=%llu scannedMB=%llu skippedLargeRegions=%llu readFailures=%llu priorityRegions=%llu fallbackRegions=%llu",
         pass,
+        fullScan ? "full" : "priority",
         stats.patched,
         static_cast<unsigned long long>(stats.scannedRegions),
         static_cast<unsigned long long>(stats.scannedBytes / (1024 * 1024)),
         static_cast<unsigned long long>(stats.skippedLargeRegions),
-        static_cast<unsigned long long>(stats.readFailures));
+        static_cast<unsigned long long>(stats.readFailures),
+        static_cast<unsigned long long>(priorityRegions.size()),
+        static_cast<unsigned long long>(fallbackRegions.size()));
 
     return stats.patched;
 }
@@ -573,12 +637,21 @@ DWORD WINAPI takefistsPatchThread(LPVOID) {
     log("Takefists memory patch thread started; watching for stock GSC bytecode pattern 16 01 38 2A C6 00 00");
 
     int totalPatched = 0;
+    int quietPassesAfterPatch = 0;
     for (int pass = 1; pass <= 24; ++pass) {
-        Sleep(pass == 1 ? 8000 : 5000);
-        totalPatched += scanAndPatchTakefistsOnce(pass);
+        Sleep(pass == 1 ? 1500 : (pass <= 3 ? 2000 : 5000));
+        const bool fullScan = pass >= 3 || totalPatched > 0;
+        const int patchedThisPass = scanAndPatchTakefistsOnce(pass, fullScan);
+        totalPatched += patchedThisPass;
 
-        if (totalPatched >= 2) {
-            log("Takefists memory patch target reached: totalPatched=%d", totalPatched);
+        if (patchedThisPass > 0) {
+            quietPassesAfterPatch = 0;
+        } else if (totalPatched > 0) {
+            ++quietPassesAfterPatch;
+        }
+
+        if (totalPatched >= 2 && quietPassesAfterPatch >= 2) {
+            log("Takefists memory patch target reached after quiet follow-up passes: totalPatched=%d", totalPatched);
             break;
         }
     }
@@ -619,7 +692,8 @@ bool isTargetStringTable(const char* rawName) {
            name == "mp/classtable_arena_alt.csv" ||
            name == "mp/classtable_arena_blueprints.csv" ||
            name == "mp/arenaggweapons.csv" ||
-           name == "mp/arenaggweapons_alt.csv" ||
+           name == "mp/statstable.csv" ||
+           ((kEnableAttachmentMapScopeRedirect || kEnableAttachmentMapCsvScopeRedirect) && name == "mp/attachmentmap.csv") ||
            isGunsmithVariantTableName(name);
 }
 
@@ -735,6 +809,28 @@ std::optional<CsvTable> parseCsv(const fs::path& path) {
     return out;
 }
 
+std::string cachePathKey(const fs::path& path) {
+    return toLower(normalizeAssetName(path.string()));
+}
+
+std::shared_ptr<const CsvTable> parseCsvCached(const fs::path& path, const fs::file_time_type& lastWrite) {
+    const std::string key = cachePathKey(path);
+    auto it = g_csvCache.find(key);
+    if (it != g_csvCache.end() && it->second.table && it->second.lastWrite == lastWrite) {
+        return it->second.table;
+    }
+
+    auto parsed = parseCsv(path);
+    if (!parsed) return {};
+
+    CachedCsvEntry entry{};
+    entry.lastWrite = lastWrite;
+    entry.table = std::make_shared<CsvTable>(std::move(*parsed));
+    auto stored = entry.table;
+    g_csvCache[key] = std::move(entry);
+    return stored;
+}
+
 std::optional<std::size_t> findCsvRowByLabel(const CsvTable& csv, const std::string& label) {
     const std::string wanted = toLower(label);
     for (std::size_t i = 0; i < csv.rows.size(); ++i) {
@@ -776,6 +872,137 @@ std::vector<std::string> splitListTokens(const std::string& raw) {
 std::string makeCustomAttachmentCell(const std::string& attachmentToken) {
     if (attachmentToken.find('|') != std::string::npos) return attachmentToken;
     return attachmentToken + "|0";
+}
+
+std::vector<std::string> splitWhitespaceTokens(const std::string& value) {
+    std::vector<std::string> out{};
+    std::string current{};
+
+    auto flush = [&]() {
+        if (!current.empty()) {
+            out.emplace_back(std::move(current));
+            current.clear();
+        }
+    };
+
+    for (char ch : value) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isspace(uch)) {
+            flush();
+        } else {
+            current.push_back(ch);
+        }
+    }
+
+    flush();
+    return out;
+}
+
+std::string attachmentTokenBase(const std::string& token) {
+    std::string base = toLower(trim(token));
+    const auto pipe = base.find('|');
+    if (pipe != std::string::npos) {
+        base.resize(pipe);
+    }
+    return base;
+}
+
+bool isOpticAttachmentBase(const std::string& base) {
+    return base == "scope" ||
+           base == "scopenorail" ||
+           base == "scopenvg" ||
+           base == "ironsdefault" ||
+           base == "ironsight" ||
+           startsWith(base, "reflex") ||
+           startsWith(base, "holo") ||
+           startsWith(base, "acog") ||
+           startsWith(base, "thermal") ||
+           startsWith(base, "hybrid") ||
+           startsWith(base, "vzscope");
+}
+
+std::string mergeDefaultRecipeWithAttachments(
+    const std::string& recipe,
+    const std::vector<std::string>& attachmentTokens,
+    bool* changed = nullptr
+) {
+    std::vector<std::string> desiredTokens{};
+    desiredTokens.reserve(attachmentTokens.size());
+
+    std::unordered_set<std::string> desiredBases{};
+    bool desiredHasOptic = false;
+    for (const auto& rawToken : attachmentTokens) {
+        const std::string rawBase = attachmentTokenBase(rawToken);
+        if (rawBase.empty() || rawBase == "none" || rawBase == "null") continue;
+
+        const std::string token = makeCustomAttachmentCell(trim(rawToken));
+        const std::string base = attachmentTokenBase(token);
+        if (base.empty() || base == "none" || base == "null") continue;
+
+        desiredTokens.emplace_back(token);
+        desiredBases.emplace(base);
+        if (isOpticAttachmentBase(base)) {
+            desiredHasOptic = true;
+        }
+    }
+
+    const auto tokens = splitWhitespaceTokens(recipe);
+    std::vector<std::string> out{};
+    out.reserve(tokens.size() + desiredTokens.size());
+
+    for (const auto& token : tokens) {
+        const std::string base = attachmentTokenBase(token);
+        if (desiredBases.find(base) != desiredBases.end()) continue;
+        if (desiredHasOptic && isOpticAttachmentBase(base)) continue;
+        out.emplace_back(token);
+    }
+
+    for (const auto& token : desiredTokens) {
+        out.emplace_back(token);
+    }
+
+    std::string joined{};
+    for (const auto& token : out) {
+        if (!joined.empty()) joined.push_back(' ');
+        joined += token;
+    }
+
+    if (changed) {
+        *changed = trim(recipe) != joined;
+    }
+    return joined;
+}
+
+std::string replaceDefaultOpticRecipeWithThermal(
+    const std::string& recipe,
+    bool appendIfMissing,
+    bool* changed = nullptr
+) {
+    constexpr const char* kForcedThermalDefault = "thermal2|1";
+    (void)appendIfMissing;
+    return mergeDefaultRecipeWithAttachments(recipe, std::vector<std::string>{ kForcedThermalDefault }, changed);
+}
+
+std::vector<std::string> nonOpticAttachmentTokens(const std::vector<std::string>& attachmentTokens) {
+    std::vector<std::string> out{};
+    out.reserve(attachmentTokens.size());
+    for (const auto& token : attachmentTokens) {
+        const std::string base = attachmentTokenBase(token);
+        if (base.empty() || base == "none" || base == "null") continue;
+        if (isOpticAttachmentBase(base)) continue;
+        out.emplace_back(token);
+    }
+    return out;
+}
+
+std::string firstOpticAttachmentTokenBase(const BlueprintAttachmentPatch& patch) {
+    for (const auto& token : patch.attachments) {
+        const std::string base = attachmentTokenBase(token);
+        if (isOpticAttachmentBase(base) && base != "scope" && base != "ironsdefault" && base != "ironsight") {
+            return base;
+        }
+    }
+    return {};
 }
 
 std::optional<std::size_t> findAttachmentRow(const CsvTable& csv, const std::string& prefix, int index) {
@@ -843,7 +1070,31 @@ BlueprintAttachmentMap buildBlueprintAttachmentMap(const CsvTable& csv, int* pat
     BlueprintAttachmentMap out{};
     collectBlueprintAttachmentPatches(csv, "loadoutPrimary", "loadoutPrimaryVariantID", "loadoutPrimaryAttachment", out, patchCount);
     collectBlueprintAttachmentPatches(csv, "loadoutSecondary", "loadoutSecondaryVariantID", "loadoutSecondaryAttachment", out, patchCount);
+    addSyntheticT9ThermalAttachmentPatches(out, patchCount);
     return out;
+}
+
+const BlueprintAttachmentMap* getBlueprintAttachmentMapCached(
+    const fs::path& path,
+    const fs::file_time_type& lastWrite,
+    const CsvTable& csv,
+    int* patchCount
+) {
+    const std::string key = cachePathKey(path);
+    if (g_blueprintAttachmentCache.valid &&
+        g_blueprintAttachmentCache.pathKey == key &&
+        g_blueprintAttachmentCache.lastWrite == lastWrite) {
+        if (patchCount) *patchCount = g_blueprintAttachmentCache.patchCount;
+        return &g_blueprintAttachmentCache.patchesByRoot;
+    }
+
+    g_blueprintAttachmentCache.pathKey = key;
+    g_blueprintAttachmentCache.lastWrite = lastWrite;
+    g_blueprintAttachmentCache.patchesByRoot = buildBlueprintAttachmentMap(csv, &g_blueprintAttachmentCache.patchCount);
+    g_blueprintAttachmentCache.valid = true;
+
+    if (patchCount) *patchCount = g_blueprintAttachmentCache.patchCount;
+    return &g_blueprintAttachmentCache.patchesByRoot;
 }
 
 const BlueprintAttachmentPatch* selectBlueprintPatchForVariant(
@@ -864,6 +1115,46 @@ const BlueprintAttachmentPatch* selectBlueprintPatchForVariant(
     return fallback;
 }
 
+const BlueprintAttachmentPatch* selectBlueprintPatchForDefault(
+    const std::vector<BlueprintAttachmentPatch>& patches
+) {
+    const BlueprintAttachmentPatch* firstBlankDefault = nullptr;
+    const BlueprintAttachmentPatch* firstPatch = nullptr;
+    for (const auto& patch : patches) {
+        if (!firstPatch) {
+            firstPatch = &patch;
+        }
+        if (std::find(patch.variantIds.begin(), patch.variantIds.end(), "0") != patch.variantIds.end()) {
+            return &patch;
+        }
+        if (patch.variantIds.empty() && !firstBlankDefault) {
+            firstBlankDefault = &patch;
+        }
+    }
+    return firstBlankDefault ? firstBlankDefault : firstPatch;
+}
+
+int countBlueprintDefaultPatchRoots(const BlueprintAttachmentMap& patchesByRoot) {
+    int count = 0;
+    for (const auto& entry : patchesByRoot) {
+        if (selectBlueprintPatchForDefault(entry.second)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool looksLikeScopedAttachmentCell(const std::string& value) {
+    const std::string lower = toLower(value);
+    return lower.find("thermal") != std::string::npos ||
+           lower.find("themal") != std::string::npos ||
+           lower.find("scope") != std::string::npos ||
+           lower.find("acog") != std::string::npos ||
+           lower.find("reflex") != std::string::npos ||
+           lower.find("holo") != std::string::npos ||
+           lower.find("elo") != std::string::npos;
+}
+
 std::optional<fs::path> findLooseAssetFile(const std::string& assetName) {
     const auto normalized = normalizeAssetName(assetName);
     const auto lower = toLower(normalized);
@@ -881,8 +1172,6 @@ std::optional<fs::path> findLooseAssetFile(const std::string& assetName) {
         candidates.emplace_back("mp/classTable_arena_blueprints.csv");
     } else if (lower == "mp/arenaggweapons.csv") {
         candidates.emplace_back("mp/arenaGGWeapons.csv");
-    } else if (lower == "mp/arenaggweapons_alt.csv") {
-        candidates.emplace_back("mp/arenaGGWeapons_alt.csv");
     }
 
     for (const auto& root : g_assetRoots) {
@@ -893,6 +1182,301 @@ std::optional<fs::path> findLooseAssetFile(const std::string& assetName) {
     }
 
     return std::nullopt;
+}
+
+bool isT9WeaponRoot(const std::string& value) {
+    const std::string root = toLower(trim(value));
+    return startsWith(root, "iw8_") && root.find("_t9") != std::string::npos;
+}
+
+bool isUnsignedIntegerString(const std::string& value) {
+    const std::string s = trim(value);
+    if (s.empty()) return false;
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+void appendUniqueString(std::vector<std::string>& values, const std::string& value) {
+    if (value.empty()) return;
+    if (std::find(values.begin(), values.end(), value) == values.end()) {
+        values.push_back(value);
+    }
+}
+
+std::string gunsmithStemFromRoot(const std::string& root) {
+    std::string stem = toLower(trim(root));
+    if (startsWith(stem, "iw8_")) stem.erase(0, 4);
+    return stem;
+}
+
+std::string makeExtraBlueprintName(const std::string& root) {
+    std::string name = gunsmithStemFromRoot(root);
+    std::replace(name.begin(), name.end(), '_', '-');
+    return "T9-" + name;
+}
+
+std::optional<fs::path> findDumpedGunsmithVariantFileForRoot(const std::string& root) {
+    const std::string stem = gunsmithStemFromRoot(root);
+    if (stem.empty()) return std::nullopt;
+
+    const fs::path relative = fs::path("asset_dumper") / "string_table" / "mp" / "gunsmith" / (stem + "_variants.csv");
+    const std::vector<fs::path> bases{
+        g_gameRoot / ".iw8-mod",
+        g_gameRoot / "iw8-mod",
+        g_sidecarDir / ".iw8-mod",
+        g_sidecarDir / "iw8-mod"
+    };
+
+    for (const auto& base : bases) {
+        const auto path = base / relative;
+        if (fs::exists(path)) return path;
+    }
+
+    return std::nullopt;
+}
+
+bool classTableHasPrimaryRoot(const CsvTable& csv, const std::string& root) {
+    const auto rowIndex = findCsvRowByLabel(csv, "loadoutPrimary");
+    if (!rowIndex) return false;
+
+    const std::string wanted = toLower(trim(root));
+    const auto& row = csv.rows[*rowIndex];
+    for (std::size_t col = 1; col < row.size(); ++col) {
+        if (toLower(trim(row[col])) == wanted) return true;
+    }
+    return false;
+}
+
+void collectT9RootsFromArenaTable(const std::string& assetName, std::vector<std::string>& roots) {
+    auto loose = findLooseAssetFile(assetName);
+    if (!loose) return;
+
+    fs::file_time_type lastWrite{};
+    try {
+        lastWrite = fs::last_write_time(*loose);
+    } catch (...) {
+        return;
+    }
+
+    auto csv = parseCsvCached(*loose, lastWrite);
+    if (!csv) return;
+
+    for (std::size_t row = 1; row < csv->rows.size(); ++row) {
+        if (csv->rows[row].empty()) continue;
+        const std::string root = toLower(trim(csv->rows[row][0]));
+        if (isT9WeaponRoot(root)) {
+            appendUniqueString(roots, root);
+        }
+    }
+}
+
+void collectT9PrimaryRootsFromArenaTable(const std::string& assetName, std::vector<std::string>& roots) {
+    auto loose = findLooseAssetFile(assetName);
+    if (!loose) return;
+
+    fs::file_time_type lastWrite{};
+    try {
+        lastWrite = fs::last_write_time(*loose);
+    } catch (...) {
+        return;
+    }
+
+    auto csv = parseCsvCached(*loose, lastWrite);
+    if (!csv) return;
+
+    for (std::size_t row = 1; row < csv->rows.size(); ++row) {
+        if (csv->rows[row].empty()) continue;
+        const std::string root = toLower(trim(csv->rows[row][0]));
+        const std::string categories = csv->rows[row].size() > 4 ? toLower(trim(csv->rows[row][4])) : std::string{};
+        if (isT9WeaponRoot(root) && categories.find("rand_primary") != std::string::npos) {
+            appendUniqueString(roots, root);
+        }
+    }
+}
+
+void collectScopedPrimaryRootsFromArenaTable(const std::string& assetName, std::vector<std::string>& roots) {
+    auto loose = findLooseAssetFile(assetName);
+    if (!loose) return;
+
+    fs::file_time_type lastWrite{};
+    try {
+        lastWrite = fs::last_write_time(*loose);
+    } catch (...) {
+        return;
+    }
+
+    auto csv = parseCsvCached(*loose, lastWrite);
+    if (!csv) return;
+
+    for (std::size_t row = 1; row < csv->rows.size(); ++row) {
+        if (csv->rows[row].empty()) continue;
+        const std::string root = toLower(trim(csv->rows[row][0]));
+        const std::string categories = csv->rows[row].size() > 4 ? toLower(trim(csv->rows[row][4])) : std::string{};
+        const bool isScopedPrimary =
+            categories.find("rand_sniper") != std::string::npos ||
+            categories.find("rand_sniperdmr") != std::string::npos;
+        if (startsWith(root, "iw8_") && isScopedPrimary) {
+            appendUniqueString(roots, root);
+        }
+    }
+}
+
+void addSyntheticT9ThermalAttachmentPatches(BlueprintAttachmentMap& out, int* patchCount) {
+    (void)out;
+    (void)patchCount;
+    static bool loggedDisabled = false;
+    if (!loggedDisabled) {
+        loggedDisabled = true;
+        log("Synthetic T9 primary thermal custom overlay disabled; mp/classtable_arena_blueprints.csv is authoritative for gunsmith attachment overlays");
+    }
+    return;
+
+    std::vector<std::string> roots{};
+    collectT9PrimaryRootsFromArenaTable("mp/arenaggweapons.csv", roots);
+
+    int added = 0;
+    constexpr const char* kForcedThermalAttachment = "thermal2|1";
+    for (const auto& root : roots) {
+        auto& patches = out[root];
+        const bool alreadyHasSyntheticThermal = std::any_of(
+            patches.begin(),
+            patches.end(),
+            [&](const BlueprintAttachmentPatch& patch) {
+                return patch.sourceColumn == -2000 &&
+                       patch.attachments.size() == 1 &&
+                       patch.attachments[0] == kForcedThermalAttachment;
+            });
+        if (alreadyHasSyntheticThermal) continue;
+
+        BlueprintAttachmentPatch patch{};
+        patch.attachments.emplace_back(kForcedThermalAttachment);
+        patch.sourceColumn = -2000;
+        patches.emplace_back(std::move(patch));
+        ++added;
+        if (patchCount) ++(*patchCount);
+    }
+
+    if (added > 0) {
+        log("Synthetic T9 primary thermal overlay prepared: roots=%d attachment='%s' appliesToVariants='all including 0'",
+            added, kForcedThermalAttachment);
+    }
+}
+
+std::string collectNonDefaultVariantIdsFromDump(
+    const std::string& root,
+    int* sourceVariantRows,
+    int* scopedVariantRows,
+    fs::path* sourcePath
+) {
+    if (sourceVariantRows) *sourceVariantRows = 0;
+    if (scopedVariantRows) *scopedVariantRows = 0;
+    if (sourcePath) *sourcePath = fs::path{};
+
+    auto path = findDumpedGunsmithVariantFileForRoot(root);
+    if (!path) return {};
+    if (sourcePath) *sourcePath = *path;
+
+    fs::file_time_type lastWrite{};
+    try {
+        lastWrite = fs::last_write_time(*path);
+    } catch (...) {
+        return {};
+    }
+
+    auto csv = parseCsvCached(*path, lastWrite);
+    if (!csv) return {};
+
+    std::vector<std::string> ids{};
+    for (std::size_t row = 1; row < csv->rows.size(); ++row) {
+        const auto& cells = csv->rows[row];
+        if (cells.size() < 3) continue;
+
+        const std::string id = trim(cells[0]);
+        if (!isUnsignedIntegerString(id) || id == "0") continue;
+
+        const std::string rowRoot = toLower(trim(cells[2]));
+        if (rowRoot != toLower(trim(root))) continue;
+
+        bool hasAttachmentData = false;
+        bool hasScopedData = false;
+        const std::size_t lastAttachmentCol = (std::min<std::size_t>)(15, cells.size() - 1);
+        for (std::size_t col = 4; col <= lastAttachmentCol; ++col) {
+            const std::string value = trim(cells[col]);
+            if (isEmptyOrNoneValue(value)) continue;
+            hasAttachmentData = true;
+            if (looksLikeScopedAttachmentCell(value)) {
+                hasScopedData = true;
+            }
+        }
+
+        if (!hasAttachmentData) continue;
+
+        appendUniqueString(ids, id);
+        if (sourceVariantRows) ++(*sourceVariantRows);
+        if (hasScopedData && scopedVariantRows) ++(*scopedVariantRows);
+    }
+
+    std::string joined{};
+    for (const auto& id : ids) {
+        if (!joined.empty()) joined.push_back(' ');
+        joined += id;
+    }
+    return joined;
+}
+
+std::vector<ExtraBlueprintColumn> buildExtraT9BlueprintColumns(const CsvTable& classCsv) {
+    std::vector<std::string> roots{};
+    collectT9RootsFromArenaTable("mp/arenaggweapons.csv", roots);
+
+    std::vector<ExtraBlueprintColumn> columns{};
+    for (const auto& root : roots) {
+        if (classTableHasPrimaryRoot(classCsv, root)) continue;
+
+        int sourceVariantRows = 0;
+        int scopedVariantRows = 0;
+        fs::path sourcePath{};
+        std::string variantIds = collectNonDefaultVariantIdsFromDump(root, &sourceVariantRows, &scopedVariantRows, &sourcePath);
+        if (variantIds.empty()) {
+            log("No dumped nonzero gunsmith blueprint variants found for T9 OSP root '%s'", root.c_str());
+            continue;
+        }
+
+        ExtraBlueprintColumn column{};
+        column.loadoutName = makeExtraBlueprintName(root);
+        column.primaryRoot = root;
+        column.primaryVariantIds = std::move(variantIds);
+        column.sourceVariantRows = sourceVariantRows;
+        column.scopedVariantRows = scopedVariantRows;
+        columns.emplace_back(std::move(column));
+
+        log("Prepared extra OSP blueprint column for T9 root '%s' from '%s' (variants=%d scopedRows=%d)",
+            root.c_str(), sourcePath.string().c_str(), sourceVariantRows, scopedVariantRows);
+    }
+
+    return columns;
+}
+
+std::string extraBlueprintColumnValue(const ExtraBlueprintColumn& column, const std::string& label, int dstCol) {
+    if (label == "loadoutName") return column.loadoutName;
+    if (label == "loadoutArchetype") return "archetype_assault";
+    if (label == "loadoutPrimaryAddBlueprintAttachments") return "1";
+    if (label == "loadoutPrimary") return column.primaryRoot;
+    if (label == "loadoutPrimaryAttachment" || label == "loadoutPrimaryAttachment1") return "none";
+    if (startsWith(label, "loadoutPrimaryAttachment")) return "none";
+    if (label == "loadoutPrimaryCamo") return "none";
+    if (label == "loadoutPrimaryReticle") return "none";
+    if (label == "loadoutPrimaryVariantID") return column.primaryVariantIds;
+    if (label == "loadoutSecondaryAddBlueprintAttachments") return "0";
+    if (label == "loadoutSecondary") return "none";
+    if (startsWith(label, "loadoutSecondaryAttachment")) return "none";
+    if (label == "loadoutSecondaryCamo") return "none";
+    if (label == "loadoutSecondaryReticle") return "none";
+    if (label == "loadoutSecondaryVariantID") return "-1";
+    if (label == "loadoutOverkill") return "0";
+    if (label == "loadoutPerk1") return "specialty_quickfix";
+    if (label == "loadoutPerk2") return "specialty_hardline";
+    if (label == "loadoutPerk3") return "specialty_amp";
+    (void)dstCol;
+    return "none";
 }
 
 __declspec(noinline) bool safePatchStringTable(
@@ -963,12 +1547,8 @@ std::string defaultForMissingRow(const std::string& label, int dstCol) {
 
 std::optional<fs::path> findExtraPoolFile() {
     const std::vector<std::string> candidates{
-        "mp/wz_gulag_extra_string_pool_for_sidecar.csv",
-        "wz_gulag_extra_string_pool_for_sidecar.csv",
-        "mp/extra_string_pool.csv",
-        "extra_string_pool.csv",
-        "mp/expanded_string_pool.csv",
-        "expanded_string_pool.csv"
+        "mp/stringpool.csv",
+        "stringpool.csv"
     };
 
     for (const auto& root : g_assetRoots) {
@@ -981,20 +1561,36 @@ std::optional<fs::path> findExtraPoolFile() {
     return std::nullopt;
 }
 
-std::vector<std::string> loadExtraPoolStrings(fs::path* foundPath = nullptr) {
+const std::vector<std::string>& loadExtraPoolStrings(fs::path* foundPath = nullptr) {
     if (foundPath) *foundPath = fs::path{};
-    std::vector<std::string> values{};
 
     auto path = findExtraPoolFile();
-    if (!path) return values;
+    if (!path) {
+        g_extraPoolCache.valid = false;
+        return g_emptyStringVector;
+    }
     if (foundPath) *foundPath = *path;
 
-    auto csv = parseCsv(*path);
-    if (!csv) {
-        log("Failed to parse external string pool CSV '%s'", path->string().c_str());
-        return values;
+    fs::file_time_type lastWrite{};
+    try {
+        lastWrite = fs::last_write_time(*path);
+    } catch (...) {
+        return g_emptyStringVector;
     }
 
+    if (g_extraPoolCache.valid &&
+        g_extraPoolCache.path == *path &&
+        g_extraPoolCache.lastWrite == lastWrite) {
+        return g_extraPoolCache.values;
+    }
+
+    auto csv = parseCsvCached(*path, lastWrite);
+    if (!csv) {
+        log("Failed to parse external string pool CSV '%s'", path->string().c_str());
+        return g_emptyStringVector;
+    }
+
+    std::vector<std::string> values{};
     for (std::size_t r = 0; r < csv->rows.size(); ++r) {
         for (std::size_t c = 0; c < csv->rows[r].size(); ++c) {
             std::string v = csv->rows[r][c];
@@ -1004,13 +1600,575 @@ std::vector<std::string> loadExtraPoolStrings(fs::path* foundPath = nullptr) {
         }
     }
 
-    return values;
+    g_extraPoolCache.path = *path;
+    g_extraPoolCache.lastWrite = lastWrite;
+    g_extraPoolCache.values = std::move(values);
+    g_extraPoolCache.valid = true;
+    return g_extraPoolCache.values;
 }
 
 
 bool isGenericOspWeaponTable(const std::string& assetName) {
     const std::string lower = toLower(normalizeAssetName(assetName));
-    return lower == "mp/arenaggweapons.csv" || lower == "mp/arenaggweapons_alt.csv";
+    return lower == "mp/arenaggweapons.csv";
+}
+
+bool isStatstableTable(const std::string& assetName) {
+    return toLower(normalizeAssetName(assetName)) == "mp/statstable.csv";
+}
+
+bool isAttachmentMapTable(const std::string& assetName) {
+    return toLower(normalizeAssetName(assetName)) == "mp/attachmentmap.csv";
+}
+
+fs::file_time_type latestT9PrimaryRootSourceWriteTime() {
+    fs::file_time_type latest{};
+    for (const char* assetName : { "mp/arenaggweapons.csv" }) {
+        auto loose = findLooseAssetFile(assetName);
+        if (!loose) continue;
+
+        try {
+            const auto writeTime = fs::last_write_time(*loose);
+            if (latest < writeTime) latest = writeTime;
+        } catch (...) {
+        }
+    }
+    return latest;
+}
+
+bool replaceStatstableCsvDefaultAttachments(
+    StringTable* table,
+    const std::string& assetName,
+    const BlueprintAttachmentMap& patchesByRoot,
+    int blueprintPatchCount,
+    const fs::file_time_type& lastWrite
+) {
+    if (!table) return false;
+
+    const int targetRows = table->rowCount;
+    const int targetCols = table->columnCount;
+    const int originalUnique = table->uniqueCellCount;
+    const char* originalName = table->name;
+    int* originalHashes = table->hashes;
+    const char** originalStrings = table->strings;
+    std::uint16_t* originalCellIndices = table->cellIndices;
+
+    if (targetRows <= 0 || targetCols <= 9) {
+        log("Refusing statstable CSV default attachment overlay '%s': target table has invalid shape (%d rows, %d cols)",
+            assetName.c_str(), targetRows, targetCols);
+        return false;
+    }
+    if (!originalCellIndices || !originalStrings || originalUnique <= 0) {
+        log("Refusing statstable CSV default attachment overlay '%s': target table has invalid backing arrays (unique=%d)",
+            assetName.c_str(), originalUnique);
+        return false;
+    }
+
+    const int defaultPatchRoots = countBlueprintDefaultPatchRoots(patchesByRoot);
+    if (defaultPatchRoots <= 0) {
+        static bool loggedNoRoots = false;
+        if (!loggedNoRoots) {
+            loggedNoRoots = true;
+            log("Statstable CSV default attachment overlay skipped: no attachment patches found in mp/classtable_arena_blueprints.csv (blueprintPatchColumns=%d)",
+                blueprintPatchCount);
+        }
+        return false;
+    }
+
+    const auto cellCount = static_cast<std::size_t>(targetRows) * static_cast<std::size_t>(targetCols);
+    if (cellCount == 0 || cellCount > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        log("Refusing statstable CSV default attachment overlay '%s': target cell count is invalid (%llu)",
+            assetName.c_str(), static_cast<unsigned long long>(cellCount));
+        return false;
+    }
+
+    std::unordered_map<std::string, std::uint16_t> expandedIndexByString{};
+    expandedIndexByString.reserve(static_cast<std::size_t>(originalUnique) + static_cast<std::size_t>(defaultPatchRoots));
+
+    auto owned = std::make_unique<OwnedTable>();
+    owned->assetName = normalizeAssetName(assetName);
+    owned->lastWrite = lastWrite;
+    owned->target = table;
+    owned->cellIndices.assign(originalCellIndices, originalCellIndices + cellCount);
+
+    owned->stringPointers.reserve(static_cast<std::size_t>(originalUnique) + static_cast<std::size_t>(defaultPatchRoots));
+    owned->hashes.reserve(static_cast<std::size_t>(originalUnique) + static_cast<std::size_t>(defaultPatchRoots));
+    for (int i = 0; i < originalUnique; ++i) {
+        const char* s = originalStrings[i] ? originalStrings[i] : "";
+        owned->stringPointers.push_back(s);
+        owned->hashes.push_back(originalHashes ? originalHashes[i] : static_cast<int>(jenkinsOneAtATime(std::string(s))));
+        expandedIndexByString.emplace(std::string(s), static_cast<std::uint16_t>(i));
+    }
+
+    auto originalCell = [&](int row, int col, std::uint16_t* outIndex = nullptr) -> std::string {
+        if (outIndex) *outIndex = 0;
+        if (row < 0 || col < 0 || row >= targetRows || col >= targetCols) return {};
+        const auto flat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(col);
+        const std::uint16_t idx = originalCellIndices[flat];
+        if (outIndex) *outIndex = idx;
+        if (idx >= originalUnique) return {};
+        return originalStrings[idx] ? std::string(originalStrings[idx]) : std::string{};
+    };
+
+    int appendedGeneratedStrings = 0;
+    auto ensureStringIndex = [&](const std::string& value, std::uint16_t& outIndex) -> bool {
+        auto it = expandedIndexByString.find(value);
+        if (it != expandedIndexByString.end()) {
+            outIndex = it->second;
+            return true;
+        }
+
+        const std::size_t nextIndex = owned->stringPointers.size();
+        if (nextIndex > 0xFFFFu) return false;
+
+        owned->stringStorage.emplace_back(value);
+        owned->stringPointers.push_back(owned->stringStorage.back().c_str());
+        owned->hashes.push_back(static_cast<int>(jenkinsOneAtATime(value)));
+        outIndex = static_cast<std::uint16_t>(nextIndex);
+        expandedIndexByString.emplace(value, outIndex);
+        ++appendedGeneratedStrings;
+        return true;
+    };
+
+    int matchedRoots = 0;
+    int changedDefaultCells = 0;
+    int unchangedDefaultCells = 0;
+    for (int row = 0; row < targetRows; ++row) {
+        const std::string root = toLower(trim(originalCell(row, 4)));
+        auto patchIt = patchesByRoot.find(root);
+        if (patchIt == patchesByRoot.end() || patchIt->second.empty()) continue;
+
+        const BlueprintAttachmentPatch* patch = selectBlueprintPatchForDefault(patchIt->second);
+        if (!patch) continue;
+
+        ++matchedRoots;
+
+        const std::vector<std::string> nonOpticAttachments = nonOpticAttachmentTokens(patch->attachments);
+        if (nonOpticAttachments.empty()) continue;
+
+        const std::string originalRecipe = originalCell(row, 9);
+        bool changed = false;
+        const std::string desiredRecipe = mergeDefaultRecipeWithAttachments(originalRecipe, nonOpticAttachments, &changed);
+        if (!changed) {
+            ++unchangedDefaultCells;
+            continue;
+        }
+
+        std::uint16_t desiredIndex = 0;
+        if (!ensureStringIndex(desiredRecipe, desiredIndex)) {
+            log("Refusing statstable CSV default attachment overlay '%s': generated string pool would exceed uint16 cell-index limit",
+                assetName.c_str());
+            return false;
+        }
+
+        const auto flat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + 9u;
+        owned->cellIndices[flat] = desiredIndex;
+        ++changedDefaultCells;
+    }
+
+    if (changedDefaultCells <= 0) {
+        log("Statstable CSV default attachment overlay found %d blueprint root rows in '%s' but no default recipes needed changes (defaultPatchRoots=%d blueprintPatchColumns=%d)",
+            matchedRoots, assetName.c_str(), defaultPatchRoots, blueprintPatchCount);
+        return false;
+    }
+
+    const int expandedUnique = static_cast<int>(owned->stringPointers.size());
+    if (!safePatchStringTable(table, originalName, targetCols, targetRows, expandedUnique,
+                              owned->cellIndices.data(), owned->hashes.data(), owned->stringPointers.data())) {
+        log("Failed to overlay statstable CSV default attachment cell-index memory for '%s'", assetName.c_str());
+        return false;
+    }
+
+    const auto activeKey = makeActiveKey(assetName, table);
+    OwnedTable* active = owned.get();
+    g_ownedPool.emplace_back(std::move(owned));
+    g_active[activeKey] = active;
+
+    log("Statstable CSV default attachment overlay stats for '%s': blueprintPatchColumns=%d defaultPatchRoots=%d matchedRows=%d changedDefaultCells=%d unchangedDefaultCells=%d appendedGeneratedStrings=%d originalUnique=%d expandedUnique=%d",
+        assetName.c_str(),
+        blueprintPatchCount,
+        defaultPatchRoots,
+        matchedRoots,
+        changedDefaultCells,
+        unchangedDefaultCells,
+        appendedGeneratedStrings,
+        originalUnique,
+        expandedUnique);
+
+    return true;
+}
+
+bool replaceAttachmentMapScopeWithThermal(StringTable* table, const std::string& assetName, const fs::file_time_type& lastWrite) {
+    if (!table) return false;
+
+    const int targetRows = table->rowCount;
+    const int targetCols = table->columnCount;
+    const int originalUnique = table->uniqueCellCount;
+    const char* originalName = table->name;
+    int* originalHashes = table->hashes;
+    const char** originalStrings = table->strings;
+    std::uint16_t* originalCellIndices = table->cellIndices;
+
+    if (targetRows <= 0 || targetCols <= 0) {
+        log("Refusing attachmentmap scope-to-thermal overlay '%s': target table has invalid shape (%d rows, %d cols)",
+            assetName.c_str(), targetRows, targetCols);
+        return false;
+    }
+    if (!originalCellIndices || !originalStrings || originalUnique <= 0) {
+        log("Refusing attachmentmap scope-to-thermal overlay '%s': target table has invalid backing arrays (unique=%d)",
+            assetName.c_str(), originalUnique);
+        return false;
+    }
+
+    std::vector<std::string> roots{};
+    collectScopedPrimaryRootsFromArenaTable("mp/arenaggweapons.csv", roots);
+    if (roots.empty()) {
+        static bool loggedNoRoots = false;
+        if (!loggedNoRoots) {
+            loggedNoRoots = true;
+            log("Attachmentmap scope-to-thermal overlay skipped: no sniper/DMR primary roots found in OSP arena weapon tables");
+        }
+        return false;
+    }
+
+    const auto cellCount = static_cast<std::size_t>(targetRows) * static_cast<std::size_t>(targetCols);
+    if (cellCount == 0 || cellCount > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        log("Refusing attachmentmap scope-to-thermal overlay '%s': target cell count is invalid (%llu)",
+            assetName.c_str(), static_cast<unsigned long long>(cellCount));
+        return false;
+    }
+
+    auto originalCell = [&](int row, int col, std::uint16_t* outIndex = nullptr) -> std::string {
+        if (outIndex) *outIndex = 0;
+        if (row < 0 || col < 0 || row >= targetRows || col >= targetCols) return {};
+        const auto flat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(col);
+        const std::uint16_t idx = originalCellIndices[flat];
+        if (outIndex) *outIndex = idx;
+        if (idx >= originalUnique) return {};
+        return originalStrings[idx] ? std::string(originalStrings[idx]) : std::string{};
+    };
+
+    int headerRow = -1;
+    int scopeCol = -1;
+    int thermal2Col = -1;
+    int thermalCol = -1;
+    int thermal3Col = -1;
+    int thermalVzCol = -1;
+    for (int row = 0; row < targetRows; ++row) {
+        int rowScopeCol = -1;
+        int rowThermal2Col = -1;
+        int rowThermalCol = -1;
+        int rowThermal3Col = -1;
+        int rowThermalVzCol = -1;
+        for (int col = 0; col < targetCols; ++col) {
+            const std::string label = toLower(trim(originalCell(row, col)));
+            if (label == "scope") rowScopeCol = col;
+            if (label == "thermal2") rowThermal2Col = col;
+            if (label == "thermal") rowThermalCol = col;
+            if (label == "thermal3") rowThermal3Col = col;
+            if (label == "thermalvz") rowThermalVzCol = col;
+        }
+
+        if (rowScopeCol >= 0 && (rowThermal2Col >= 0 || rowThermalCol >= 0 || rowThermal3Col >= 0 || rowThermalVzCol >= 0)) {
+            headerRow = row;
+            scopeCol = rowScopeCol;
+            thermal2Col = rowThermal2Col;
+            thermalCol = rowThermalCol;
+            thermal3Col = rowThermal3Col;
+            thermalVzCol = rowThermalVzCol;
+            break;
+        }
+    }
+
+    if (headerRow < 0 || scopeCol < 0) {
+        log("Attachmentmap scope-to-thermal overlay skipped for '%s': could not locate scope/thermal columns (rows=%d cols=%d)",
+            assetName.c_str(), targetRows, targetCols);
+        return false;
+    }
+
+    std::vector<int> thermalPreferenceCols{};
+    if (thermal2Col >= 0) thermalPreferenceCols.push_back(thermal2Col);
+    if (thermalCol >= 0) thermalPreferenceCols.push_back(thermalCol);
+    if (thermal3Col >= 0) thermalPreferenceCols.push_back(thermal3Col);
+    if (thermalVzCol >= 0) thermalPreferenceCols.push_back(thermalVzCol);
+
+    auto isTargetRoot = [&](const std::string& value) {
+        const std::string wanted = toLower(trim(value));
+        for (const auto& root : roots) {
+            if (wanted == root || startsWith(wanted, root + "_")) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto owned = std::make_unique<OwnedTable>();
+    owned->assetName = normalizeAssetName(assetName);
+    owned->lastWrite = lastWrite;
+    owned->target = table;
+    owned->cellIndices.assign(originalCellIndices, originalCellIndices + cellCount);
+
+    owned->stringPointers.reserve(static_cast<std::size_t>(originalUnique));
+    owned->hashes.reserve(static_cast<std::size_t>(originalUnique));
+    for (int i = 0; i < originalUnique; ++i) {
+        const char* s = originalStrings[i] ? originalStrings[i] : "";
+        owned->stringPointers.push_back(s);
+        owned->hashes.push_back(originalHashes ? originalHashes[i] : static_cast<int>(jenkinsOneAtATime(std::string(s))));
+    }
+
+    int matchedRows = 0;
+    int changedScopeCells = 0;
+    int unchangedScopeCells = 0;
+    int missingThermalCells = 0;
+    for (int row = headerRow + 1; row < targetRows; ++row) {
+        const std::string rowRoot = originalCell(row, 0);
+        if (!isTargetRoot(rowRoot)) continue;
+        ++matchedRows;
+
+        std::uint16_t thermalIndex = 0;
+        std::string thermalValue{};
+        int selectedThermalCol = -1;
+        for (int candidateCol : thermalPreferenceCols) {
+            std::uint16_t candidateIndex = 0;
+            const std::string candidateValue = trim(originalCell(row, candidateCol, &candidateIndex));
+            if (candidateValue.empty()) continue;
+
+            thermalIndex = candidateIndex;
+            thermalValue = candidateValue;
+            selectedThermalCol = candidateCol;
+            break;
+        }
+
+        if (thermalValue.empty()) {
+            ++missingThermalCells;
+            continue;
+        }
+
+        std::uint16_t scopeIndex = 0;
+        const std::string scopeValue = trim(originalCell(row, scopeCol, &scopeIndex));
+        const auto flat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(scopeCol);
+        owned->cellIndices[flat] = thermalIndex;
+        (void)selectedThermalCol;
+        if (scopeValue == thermalValue) {
+            ++unchangedScopeCells;
+        } else {
+            ++changedScopeCells;
+        }
+    }
+
+    if (changedScopeCells <= 0) {
+        log("Attachmentmap scope-to-thermal overlay found %d sniper/DMR rows in '%s' but changed no scope cells (missingThermalCells=%d)",
+            matchedRows, assetName.c_str(), missingThermalCells);
+        return false;
+    }
+
+    if (!safePatchStringTable(table, originalName, targetCols, targetRows, originalUnique,
+                              owned->cellIndices.data(), owned->hashes.data(), owned->stringPointers.data())) {
+        log("Failed to overlay attachmentmap scope-to-thermal cell-index memory for '%s'", assetName.c_str());
+        return false;
+    }
+
+    const auto activeKey = makeActiveKey(assetName, table);
+    OwnedTable* active = owned.get();
+    g_ownedPool.emplace_back(std::move(owned));
+    g_active[activeKey] = active;
+
+    log("Attachmentmap scope-to-thermal overlay stats for '%s': scopedRoots=%llu headerRow=%d scopeCol=%d thermal2Col=%d thermalCol=%d thermal3Col=%d thermalVzCol=%d matchedRows=%d changedScopeCells=%d unchangedScopeCells=%d missingThermalCells=%d originalUnique=%d",
+        assetName.c_str(),
+        static_cast<unsigned long long>(roots.size()),
+        headerRow,
+        scopeCol,
+        thermal2Col,
+        thermalCol,
+        thermal3Col,
+        thermalVzCol,
+        matchedRows,
+        changedScopeCells,
+        unchangedScopeCells,
+        missingThermalCells,
+        originalUnique);
+
+    return true;
+}
+
+bool replaceAttachmentMapScopeFromBlueprintDefaults(
+    StringTable* table,
+    const std::string& assetName,
+    const BlueprintAttachmentMap& patchesByRoot,
+    int blueprintPatchCount,
+    const fs::file_time_type& lastWrite
+) {
+    if (!table) return false;
+
+    const int targetRows = table->rowCount;
+    const int targetCols = table->columnCount;
+    const int originalUnique = table->uniqueCellCount;
+    const char* originalName = table->name;
+    int* originalHashes = table->hashes;
+    const char** originalStrings = table->strings;
+    std::uint16_t* originalCellIndices = table->cellIndices;
+
+    if (targetRows <= 0 || targetCols <= 0) {
+        log("Refusing attachmentmap CSV scope overlay '%s': target table has invalid shape (%d rows, %d cols)",
+            assetName.c_str(), targetRows, targetCols);
+        return false;
+    }
+    if (!originalCellIndices || !originalStrings || originalUnique <= 0) {
+        log("Refusing attachmentmap CSV scope overlay '%s': target table has invalid backing arrays (unique=%d)",
+            assetName.c_str(), originalUnique);
+        return false;
+    }
+
+    const auto cellCount = static_cast<std::size_t>(targetRows) * static_cast<std::size_t>(targetCols);
+    if (cellCount == 0 || cellCount > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        log("Refusing attachmentmap CSV scope overlay '%s': target cell count is invalid (%llu)",
+            assetName.c_str(), static_cast<unsigned long long>(cellCount));
+        return false;
+    }
+
+    auto originalCell = [&](int row, int col, std::uint16_t* outIndex = nullptr) -> std::string {
+        if (outIndex) *outIndex = 0;
+        if (row < 0 || col < 0 || row >= targetRows || col >= targetCols) return {};
+        const auto flat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(col);
+        const std::uint16_t idx = originalCellIndices[flat];
+        if (outIndex) *outIndex = idx;
+        if (idx >= originalUnique) return {};
+        return originalStrings[idx] ? std::string(originalStrings[idx]) : std::string{};
+    };
+
+    int headerRow = -1;
+    int scopeCol = -1;
+    std::unordered_map<std::string, int> tokenCols{};
+    for (int row = 0; row < targetRows; ++row) {
+        std::unordered_map<std::string, int> rowTokenCols{};
+        int rowScopeCol = -1;
+        for (int col = 0; col < targetCols; ++col) {
+            const std::string label = toLower(trim(originalCell(row, col)));
+            if (label.empty()) continue;
+            rowTokenCols.emplace(label, col);
+            if (label == "scope") rowScopeCol = col;
+        }
+
+        if (rowScopeCol >= 0) {
+            headerRow = row;
+            scopeCol = rowScopeCol;
+            tokenCols = std::move(rowTokenCols);
+            break;
+        }
+    }
+
+    if (headerRow < 0 || scopeCol < 0) {
+        log("Attachmentmap CSV scope overlay skipped for '%s': could not locate scope header column (rows=%d cols=%d)",
+            assetName.c_str(), targetRows, targetCols);
+        return false;
+    }
+
+    auto selectPatchForRowRoot = [&](const std::string& rowRoot) -> const BlueprintAttachmentPatch* {
+        const std::string wanted = toLower(trim(rowRoot));
+        if (wanted.empty()) return nullptr;
+
+        auto exactIt = patchesByRoot.find(wanted);
+        if (exactIt != patchesByRoot.end() && !exactIt->second.empty()) {
+            return selectBlueprintPatchForDefault(exactIt->second);
+        }
+
+        const BlueprintAttachmentPatch* selected = nullptr;
+        std::size_t selectedRootLen = 0;
+        for (const auto& entry : patchesByRoot) {
+            const std::string& root = entry.first;
+            if (root.empty()) continue;
+            if (wanted == root || startsWith(wanted, root + "_")) {
+                if (root.size() >= selectedRootLen) {
+                    selected = selectBlueprintPatchForDefault(entry.second);
+                    selectedRootLen = root.size();
+                }
+            }
+        }
+        return selected;
+    };
+
+    auto owned = std::make_unique<OwnedTable>();
+    owned->assetName = normalizeAssetName(assetName);
+    owned->lastWrite = lastWrite;
+    owned->target = table;
+    owned->cellIndices.assign(originalCellIndices, originalCellIndices + cellCount);
+
+    owned->stringPointers.reserve(static_cast<std::size_t>(originalUnique));
+    owned->hashes.reserve(static_cast<std::size_t>(originalUnique));
+    for (int i = 0; i < originalUnique; ++i) {
+        const char* s = originalStrings[i] ? originalStrings[i] : "";
+        owned->stringPointers.push_back(s);
+        owned->hashes.push_back(originalHashes ? originalHashes[i] : static_cast<int>(jenkinsOneAtATime(std::string(s))));
+    }
+
+    int matchedRows = 0;
+    int changedScopeCells = 0;
+    int unchangedScopeCells = 0;
+    int missingOpticInPatch = 0;
+    int missingOpticColumn = 0;
+    int missingOpticCell = 0;
+    for (int row = headerRow + 1; row < targetRows; ++row) {
+        const std::string rowRoot = originalCell(row, 0);
+        const BlueprintAttachmentPatch* patch = selectPatchForRowRoot(rowRoot);
+        if (!patch) continue;
+        ++matchedRows;
+
+        const std::string opticBase = firstOpticAttachmentTokenBase(*patch);
+        if (opticBase.empty()) {
+            ++missingOpticInPatch;
+            continue;
+        }
+
+        auto colIt = tokenCols.find(opticBase);
+        if (colIt == tokenCols.end()) {
+            ++missingOpticColumn;
+            continue;
+        }
+
+        std::uint16_t desiredIndex = 0;
+        const std::string desiredValue = trim(originalCell(row, colIt->second, &desiredIndex));
+        if (desiredValue.empty()) {
+            ++missingOpticCell;
+            continue;
+        }
+
+        std::uint16_t scopeIndex = 0;
+        const std::string scopeValue = trim(originalCell(row, scopeCol, &scopeIndex));
+        const auto flat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(scopeCol);
+        owned->cellIndices[flat] = desiredIndex;
+
+        if (scopeValue == desiredValue) {
+            ++unchangedScopeCells;
+        } else {
+            ++changedScopeCells;
+        }
+    }
+
+    if (!safePatchStringTable(table, originalName, targetCols, targetRows, originalUnique,
+                              owned->cellIndices.data(), owned->hashes.data(), owned->stringPointers.data())) {
+        log("Failed to overlay attachmentmap CSV scope cell-index memory for '%s'", assetName.c_str());
+        return false;
+    }
+
+    const auto activeKey = makeActiveKey(assetName, table);
+    OwnedTable* active = owned.get();
+    g_ownedPool.emplace_back(std::move(owned));
+    g_active[activeKey] = active;
+
+    log("Attachmentmap CSV scope overlay stats for '%s': blueprintPatchColumns=%d headerRow=%d scopeCol=%d matchedRows=%d changedScopeCells=%d unchangedScopeCells=%d missingOpticInPatch=%d missingOpticColumn=%d missingOpticCell=%d originalUnique=%d",
+        assetName.c_str(),
+        blueprintPatchCount,
+        headerRow,
+        scopeCol,
+        matchedRows,
+        changedScopeCells,
+        unchangedScopeCells,
+        missingOpticInPatch,
+        missingOpticColumn,
+        missingOpticCell,
+        originalUnique);
+
+    return true;
 }
 
 bool replaceGenericStringTable(StringTable* table, const std::string& assetName, const CsvTable& csv, const fs::file_time_type& lastWrite) {
@@ -1053,10 +2211,13 @@ bool replaceGenericStringTable(StringTable* table, const std::string& assetName,
         return false;
     }
 
-    const auto cellCount = static_cast<std::size_t>(targetRows) * static_cast<std::size_t>(targetCols);
+    // The OSP weapon tables are full replacements. Match the loose CSV row count
+    // exactly so deleting bad rows live actually removes them from the in-memory table.
+    const int outputRows = usableRows;
+    const auto cellCount = static_cast<std::size_t>(outputRows) * static_cast<std::size_t>(targetCols);
 
     fs::path extraPoolPath{};
-    std::vector<std::string> extraPoolStrings = loadExtraPoolStrings(&extraPoolPath);
+    const std::vector<std::string>& extraPoolStrings = loadExtraPoolStrings(&extraPoolPath);
 
     std::unordered_map<std::string, std::uint16_t> expandedIndexByString{};
     expandedIndexByString.reserve(static_cast<std::size_t>(originalUnique) + extraPoolStrings.size());
@@ -1111,9 +2272,8 @@ bool replaceGenericStringTable(StringTable* table, const std::string& assetName,
     const int expandedUnique = static_cast<int>(owned->stringPointers.size());
 
     int changedCells = 0, unchangedCells = 0, missingStrings = 0, extraPoolCells = 0, loopedRows = 0;
-    for (int dstRow = 0; dstRow < targetRows; ++dstRow) {
-        const int srcRow = sourceStartRow + (dstRow % usableRows);
-        if (dstRow >= usableRows) ++loopedRows;
+    for (int dstRow = 0; dstRow < outputRows; ++dstRow) {
+        const int srcRow = sourceStartRow + dstRow;
 
         for (int dstCol = 0; dstCol < targetCols; ++dstCol) {
             const auto flat = static_cast<std::size_t>(dstRow) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(dstCol);
@@ -1143,7 +2303,7 @@ bool replaceGenericStringTable(StringTable* table, const std::string& assetName,
         }
     }
 
-    if (!safePatchStringTable(table, originalName, targetCols, targetRows, expandedUnique,
+    if (!safePatchStringTable(table, originalName, targetCols, outputRows, expandedUnique,
                               owned->cellIndices.data(), owned->hashes.data(), owned->stringPointers.data())) {
         log("Failed to overlay generic string_table cell-index memory for '%s'", assetName.c_str());
         return false;
@@ -1156,6 +2316,10 @@ bool replaceGenericStringTable(StringTable* table, const std::string& assetName,
 
     if (loopedRows > 0) {
         log("Generic OSP table safety net: source CSV has %d usable data rows; loop-filled %d target rows", usableRows, loopedRows);
+    }
+    if (outputRows != targetRows) {
+        log("Generic OSP table row count change for '%s': targetRows=%d sourceUsableRows=%d outputRows=%d",
+            assetName.c_str(), targetRows, usableRows, outputRows);
     }
     if (!extraPoolPath.empty()) {
         log("External pool loaded for generic '%s': path='%s' sourceValues=%llu appendedExtraStrings=%d skippedDuplicateExtraStrings=%d skippedOverflowExtraStrings=%d",
@@ -1170,7 +2334,13 @@ bool replaceGenericStringTable(StringTable* table, const std::string& assetName,
     return true;
 }
 
-bool replaceGunsmithVariantTable(StringTable* table, const std::string& assetName, const CsvTable& blueprintCsv, const fs::file_time_type& lastWrite) {
+bool replaceGunsmithVariantTable(
+    StringTable* table,
+    const std::string& assetName,
+    const BlueprintAttachmentMap& patchesByRoot,
+    int blueprintPatchCount,
+    const fs::file_time_type& lastWrite
+) {
     if (!table) return false;
 
     const int targetRows = table->rowCount;
@@ -1195,14 +2365,16 @@ bool replaceGunsmithVariantTable(StringTable* table, const std::string& assetNam
     auto root = gunsmithVariantRootFromAssetName(assetName);
     if (!root) return false;
 
-    int blueprintPatchCount = 0;
-    BlueprintAttachmentMap patchesByRoot = buildBlueprintAttachmentMap(blueprintCsv, &blueprintPatchCount);
     auto patchIt = patchesByRoot.find(*root);
-    if (patchIt == patchesByRoot.end() || patchIt->second.empty()) {
+    const std::vector<BlueprintAttachmentPatch>* patches = nullptr;
+    if (patchIt != patchesByRoot.end() && !patchIt->second.empty()) {
+        patches = &patchIt->second;
+    }
+
+    if (!patches) {
         return false;
     }
 
-    const std::vector<BlueprintAttachmentPatch>& patches = patchIt->second;
     const auto cellCount = static_cast<std::size_t>(targetRows) * static_cast<std::size_t>(targetCols);
     if (cellCount == 0) {
         log("Refusing gunsmith variant attachment overlay '%s': target cell count is zero", assetName.c_str());
@@ -1210,8 +2382,10 @@ bool replaceGunsmithVariantTable(StringTable* table, const std::string& assetNam
     }
 
     std::size_t maxGeneratedStrings = 1;
-    for (const auto& patch : patches) {
-        maxGeneratedStrings += patch.attachments.size();
+    if (patches) {
+        for (const auto& patch : *patches) {
+            maxGeneratedStrings += patch.attachments.size();
+        }
     }
 
     std::unordered_map<std::string, std::uint16_t> expandedIndexByString{};
@@ -1273,6 +2447,8 @@ bool replaceGunsmithVariantTable(StringTable* table, const std::string& assetNam
     int clearedCustomCells = 0;
     int generatedAttachmentCells = 0;
     int truncatedAttachments = 0;
+    int changedDefaultRecipeCells = 0;
+    int unchangedDefaultRecipeCells = 0;
 
     const int customStartCol = 5;
     const int customEndCol = (std::min)(15, targetCols - 1);
@@ -1284,7 +2460,7 @@ bool replaceGunsmithVariantTable(StringTable* table, const std::string& assetNam
         ++rootRows;
 
         const std::string rowVariantId = trim(originalCell(row, 0));
-        const BlueprintAttachmentPatch* patch = selectBlueprintPatchForVariant(patches, rowVariantId);
+        const BlueprintAttachmentPatch* patch = selectBlueprintPatchForVariant(*patches, rowVariantId);
         if (!patch) {
             ++unmatchedVariantRows;
             continue;
@@ -1293,6 +2469,89 @@ bool replaceGunsmithVariantTable(StringTable* table, const std::string& assetNam
         ++patchedRows;
         if (static_cast<int>(patch->attachments.size()) > customColCount) {
             truncatedAttachments += static_cast<int>(patch->attachments.size()) - customColCount;
+        }
+
+        if (patch->sourceColumn == -2000) {
+            if (targetCols > 4) {
+                const std::string originalRecipe = originalCell(row, 4);
+                bool changedRecipe = false;
+                const std::string desiredRecipe = replaceDefaultOpticRecipeWithThermal(originalRecipe, false, &changedRecipe);
+                if (changedRecipe) {
+                    std::uint16_t desiredRecipeIndex = 0;
+                    if (!ensureStringIndex(desiredRecipe, desiredRecipeIndex)) {
+                        log("Refusing gunsmith variant default recipe overlay '%s': generated string pool would exceed uint16 cell-index limit",
+                            assetName.c_str());
+                        return false;
+                    }
+
+                    const auto defaultFlat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + 4u;
+                    owned->cellIndices[defaultFlat] = desiredRecipeIndex;
+                    ++changedDefaultRecipeCells;
+                } else {
+                    ++unchangedDefaultRecipeCells;
+                }
+            }
+
+            if (!patch->attachments.empty()) {
+                const std::string desiredValue = makeCustomAttachmentCell(patch->attachments.front());
+                int targetCol = -1;
+                int firstEmptyCol = -1;
+
+                for (int col = customStartCol; col <= customEndCol; ++col) {
+                    const std::string currentValue = trim(originalCell(row, col));
+                    if (currentValue == desiredValue) {
+                        targetCol = col;
+                        break;
+                    }
+                    if (firstEmptyCol < 0 && currentValue.empty()) {
+                        firstEmptyCol = col;
+                    }
+                }
+
+                if (targetCol < 0) {
+                    targetCol = firstEmptyCol >= 0 ? firstEmptyCol : customEndCol;
+                }
+
+                std::uint16_t desiredIndex = 0;
+                if (!ensureStringIndex(desiredValue, desiredIndex)) {
+                    log("Refusing gunsmith variant attachment overlay '%s': generated string pool would exceed uint16 cell-index limit",
+                        assetName.c_str());
+                    return false;
+                }
+
+                const auto flat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(targetCol);
+                const std::string originalValue = originalCell(row, targetCol);
+                owned->cellIndices[flat] = desiredIndex;
+                ++generatedAttachmentCells;
+
+                if (desiredValue == originalValue) {
+                    ++unchangedCustomCells;
+                } else {
+                    ++changedCustomCells;
+                }
+            }
+
+            continue;
+        }
+
+        if (targetCols > 4 && !patch->attachments.empty()) {
+            const std::string originalRecipe = originalCell(row, 4);
+            bool changedRecipe = false;
+            const std::string desiredRecipe = mergeDefaultRecipeWithAttachments(originalRecipe, patch->attachments, &changedRecipe);
+            if (changedRecipe) {
+                std::uint16_t desiredRecipeIndex = 0;
+                if (!ensureStringIndex(desiredRecipe, desiredRecipeIndex)) {
+                    log("Refusing gunsmith variant default recipe overlay '%s': generated string pool would exceed uint16 cell-index limit",
+                        assetName.c_str());
+                    return false;
+                }
+
+                const auto defaultFlat = static_cast<std::size_t>(row) * static_cast<std::size_t>(targetCols) + 4u;
+                owned->cellIndices[defaultFlat] = desiredRecipeIndex;
+                ++changedDefaultRecipeCells;
+            } else {
+                ++unchangedDefaultRecipeCells;
+            }
         }
 
         for (int slot = 0; slot < customColCount; ++slot) {
@@ -1352,9 +2611,10 @@ bool replaceGunsmithVariantTable(StringTable* table, const std::string& assetNam
         log("Gunsmith variant attachment overlay truncated %d attachment cells for '%s' because the target table exposes only columns %d-%d",
             truncatedAttachments, assetName.c_str(), customStartCol, customEndCol);
     }
-    log("Gunsmith variant attachment overlay stats for '%s': root='%s' blueprintPatchColumns=%d rootRows=%d patchedRows=%d unmatchedVariantRows=%d generatedAttachmentCells=%d changedCustomCells=%d unchangedCustomCells=%d clearedCustomCells=%d appendedGeneratedStrings=%d originalUnique=%d expandedUnique=%d",
+    log("Gunsmith variant attachment overlay stats for '%s': root='%s' blueprintPatchColumns=%d rootRows=%d patchedRows=%d unmatchedVariantRows=%d generatedAttachmentCells=%d changedCustomCells=%d unchangedCustomCells=%d clearedCustomCells=%d changedDefaultRecipeCells=%d unchangedDefaultRecipeCells=%d appendedGeneratedStrings=%d originalUnique=%d expandedUnique=%d",
         assetName.c_str(), root->c_str(), blueprintPatchCount, rootRows, patchedRows, unmatchedVariantRows,
         generatedAttachmentCells, changedCustomCells, unchangedCustomCells, clearedCustomCells,
+        changedDefaultRecipeCells, unchangedDefaultRecipeCells,
         appendedGeneratedStrings, originalUnique, expandedUnique);
 
     return true;
@@ -1389,7 +2649,13 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
         return false;
     }
 
-    const auto cellCount = static_cast<std::size_t>(targetRows) * static_cast<std::size_t>(targetCols);
+    const bool isBlueprintClassTable = toLower(normalizeAssetName(assetName)) == "mp/classtable_arena_blueprints.csv";
+    const std::vector<ExtraBlueprintColumn> extraBlueprintColumns = isBlueprintClassTable ? buildExtraT9BlueprintColumns(csv) : std::vector<ExtraBlueprintColumn>{};
+    const int baseOutputCols = (std::max)(targetCols, sourceCols);
+    const int extraBlueprintStartCol = baseOutputCols;
+    const int outputCols = baseOutputCols + static_cast<int>(extraBlueprintColumns.size());
+
+    const auto cellCount = static_cast<std::size_t>(targetRows) * static_cast<std::size_t>(outputCols);
     if (cellCount == 0) {
         log("Refusing loose string_table '%s': target cell count is zero", assetName.c_str());
         return false;
@@ -1416,10 +2682,10 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
     // the stock no-op table load correctly. This build then appends optional external CSV strings
     // after the stock pool, so original Arena row labels/hash ordering remain untouched.
     fs::path extraPoolPath{};
-    std::vector<std::string> extraPoolStrings = loadExtraPoolStrings(&extraPoolPath);
+    const std::vector<std::string>& extraPoolStrings = loadExtraPoolStrings(&extraPoolPath);
 
     std::unordered_map<std::string, std::uint16_t> expandedIndexByString{};
-    expandedIndexByString.reserve(static_cast<std::size_t>(originalUnique) + extraPoolStrings.size());
+    expandedIndexByString.reserve(static_cast<std::size_t>(originalUnique) + extraPoolStrings.size() + cellCount);
 
     auto originalCell = [&](int row, int col, std::uint16_t* outIndex = nullptr) -> std::string {
         if (outIndex) *outIndex = 0;
@@ -1450,8 +2716,8 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
     owned->cellIndices.resize(cellCount);
 
     // Preserve all original pool entries at their exact original indices.
-    owned->stringPointers.reserve(static_cast<std::size_t>(originalUnique) + extraPoolStrings.size());
-    owned->hashes.reserve(static_cast<std::size_t>(originalUnique) + extraPoolStrings.size());
+    owned->stringPointers.reserve(static_cast<std::size_t>(originalUnique) + extraPoolStrings.size() + cellCount);
+    owned->hashes.reserve(static_cast<std::size_t>(originalUnique) + extraPoolStrings.size() + cellCount);
     for (int i = 0; i < originalUnique; ++i) {
         const char* s = originalStrings[i] ? originalStrings[i] : "";
         owned->stringPointers.push_back(s);
@@ -1462,7 +2728,8 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
     int appendedExtraStrings = 0;
     int skippedDuplicateExtraStrings = 0;
     int skippedOverflowExtraStrings = 0;
-    owned->stringStorage.reserve(extraPoolStrings.size());
+    int appendedGeneratedStrings = 0;
+    owned->stringStorage.reserve(extraPoolStrings.size() + cellCount);
     for (const auto& v : extraPoolStrings) {
         if (v.empty()) continue;
         if (expandedIndexByString.find(v) != expandedIndexByString.end()) {
@@ -1481,7 +2748,26 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
         ++appendedExtraStrings;
     }
 
-    const int expandedUnique = static_cast<int>(owned->stringPointers.size());
+    auto appendGeneratedStringIndex = [&](const std::string& value, std::uint16_t& outIndex) -> bool {
+        auto it = expandedIndexByString.find(value);
+        if (it != expandedIndexByString.end()) {
+            outIndex = it->second;
+            return true;
+        }
+
+        const std::size_t nextIndex = owned->stringPointers.size();
+        if (nextIndex > 0xFFFFu) {
+            return false;
+        }
+
+        owned->stringStorage.emplace_back(value);
+        owned->stringPointers.push_back(owned->stringStorage.back().c_str());
+        owned->hashes.push_back(static_cast<int>(jenkinsOneAtATime(value)));
+        outIndex = static_cast<std::uint16_t>(nextIndex);
+        expandedIndexByString.emplace(value, outIndex);
+        ++appendedGeneratedStrings;
+        return true;
+    };
 
     int changedCells = 0;
     int unchangedCells = 0;
@@ -1508,15 +2794,19 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
             ++missingRows;
         }
 
-        for (int dstCol = 0; dstCol < targetCols; ++dstCol) {
-            const auto flat = static_cast<std::size_t>(dstRow) * static_cast<std::size_t>(targetCols) + static_cast<std::size_t>(dstCol);
+        for (int dstCol = 0; dstCol < outputCols; ++dstCol) {
+            const auto flat = static_cast<std::size_t>(dstRow) * static_cast<std::size_t>(outputCols) + static_cast<std::size_t>(dstCol);
             std::uint16_t originalIndex = 0;
             const std::string originalValue = originalCell(dstRow, dstCol, &originalIndex);
             std::string desiredValue;
+            const int extraBlueprintIndex = dstCol - extraBlueprintStartCol;
+            const bool isExtraBlueprintColumn = extraBlueprintIndex >= 0 && extraBlueprintIndex < static_cast<int>(extraBlueprintColumns.size());
 
             if (dstCol == 0) {
                 // Keep engine row labels exactly.
                 desiredValue = originalValue;
+            } else if (isExtraBlueprintColumn) {
+                desiredValue = extraBlueprintColumnValue(extraBlueprintColumns[extraBlueprintIndex], label, dstCol);
             } else if (srcRow) {
                 const int srcCol = 1 + ((dstCol - 1) % sourceClassCols);
                 if (srcCol < static_cast<int>(srcRow->size())) {
@@ -1531,7 +2821,7 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
 
             // Exact no-op cells keep their exact original index. This matters if IW8 has duplicate
             // equal strings in the unique pool for reasons we do not understand yet.
-            if (desiredValue == originalValue) {
+            if (dstCol < targetCols && desiredValue == originalValue) {
                 owned->cellIndices[flat] = originalIndex;
                 ++unchangedCells;
                 continue;
@@ -1542,6 +2832,16 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
                 owned->cellIndices[flat] = it->second;
                 ++changedCells;
                 if (it->second >= originalUnique) ++extraPoolCells;
+            } else if (dstCol >= targetCols || isExtraBlueprintColumn) {
+                std::uint16_t generatedIndex = 0;
+                if (!appendGeneratedStringIndex(desiredValue, generatedIndex)) {
+                    log("Refusing loose string_table '%s': generated string pool would exceed uint16 cell-index limit",
+                        assetName.c_str());
+                    return false;
+                }
+                owned->cellIndices[flat] = generatedIndex;
+                ++changedCells;
+                ++extraPoolCells;
             } else {
                 // Still unknown even after external pool. Leave the original stock cell.
                 owned->cellIndices[flat] = originalIndex;
@@ -1550,10 +2850,11 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
         }
     }
 
+    const int expandedUnique = static_cast<int>(owned->stringPointers.size());
     if (!safePatchStringTable(
         table,
         originalName,
-        targetCols,
+        outputCols,
         targetRows,
         expandedUnique,
         owned->cellIndices.data(),
@@ -1568,9 +2869,20 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
     g_ownedPool.emplace_back(std::move(owned));
     g_active[activeKey] = active;
 
-    if (sourceClassCols < targetCols - 1) {
+    if (sourceClassCols < baseOutputCols - 1) {
         log("Safety net: source CSV has %d class columns; loop-filled %d target class columns to cover %d total classes",
-            sourceClassCols, loopedColumns, targetCols - 1);
+            sourceClassCols, loopedColumns, baseOutputCols - 1);
+    }
+    if (!extraBlueprintColumns.empty()) {
+        int totalVariantRows = 0;
+        int totalScopedVariantRows = 0;
+        for (const auto& column : extraBlueprintColumns) {
+            totalVariantRows += column.sourceVariantRows;
+            totalScopedVariantRows += column.scopedVariantRows;
+        }
+        log("Generated T9 OSP blueprint columns for '%s': appendedColumns=%d outputCols=%d nonzeroVariantRows=%d scopedVariantRows=%d",
+            assetName.c_str(), static_cast<int>(extraBlueprintColumns.size()), outputCols,
+            totalVariantRows, totalScopedVariantRows);
     }
     if (missingRows > 0) {
         log("Warning: source CSV was missing %d target row labels; defaults/fallback rows were used", missingRows);
@@ -1583,8 +2895,8 @@ bool replaceStringTable(StringTable* table, const std::string& assetName, const 
     } else {
         log("No external string pool CSV found; using Arena stock pool only for '%s'", assetName.c_str());
     }
-    log("Expanded-pool index overlay stats for '%s': changedCells=%d unchangedCells=%d extraPoolCells=%d missingStringsKeptStock=%d originalUnique=%d expandedUnique=%d cellCount=%llu",
-        assetName.c_str(), changedCells, unchangedCells, extraPoolCells, missingStrings, originalUnique, expandedUnique,
+    log("Expanded-pool index overlay stats for '%s': changedCells=%d unchangedCells=%d extraPoolCells=%d missingStringsKeptStock=%d appendedGeneratedStrings=%d originalUnique=%d expandedUnique=%d targetCols=%d outputCols=%d cellCount=%llu",
+        assetName.c_str(), changedCells, unchangedCells, extraPoolCells, missingStrings, appendedGeneratedStrings, originalUnique, expandedUnique, targetCols, outputCols,
         static_cast<unsigned long long>(cellCount));
 
     return true;
@@ -1622,6 +2934,130 @@ StringTable* tryReplaceStringTable(const char* givenName, StringTable* table) {
         return table;
     }
 
+    if (isStatstableTable(assetName)) {
+        auto blueprintLoose = findLooseAssetFile("mp/classtable_arena_blueprints.csv");
+        if (!blueprintLoose) {
+            static bool loggedMissingBlueprintSource = false;
+            if (!loggedMissingBlueprintSource) {
+                loggedMissingBlueprintSource = true;
+                log("Statstable table '%s' requested, but no loose mp/classtable_arena_blueprints.csv source exists under watched assets roots",
+                    assetName.c_str());
+            }
+            return table;
+        }
+
+        fs::file_time_type lastWrite{};
+        try {
+            lastWrite = fs::last_write_time(*blueprintLoose);
+        } catch (...) {
+            log("Could not read timestamp for blueprint source string_table '%s'", blueprintLoose->string().c_str());
+            return table;
+        }
+
+        auto activeIt = g_active.find(activeKey);
+        if (activeIt != g_active.end() && activeIt->second && activeIt->second->lastWrite == lastWrite && activeIt->second->target == table) {
+            return table;
+        }
+
+        auto csv = parseCsvCached(*blueprintLoose, lastWrite);
+        if (!csv) {
+            log("Failed to parse blueprint source string_table '%s' for statstable CSV non-optic default attachment overlay",
+                blueprintLoose->string().c_str());
+            return table;
+        }
+
+        int blueprintPatchCount = 0;
+        const BlueprintAttachmentMap* patchesByRoot = getBlueprintAttachmentMapCached(*blueprintLoose, lastWrite, *csv, &blueprintPatchCount);
+        if (!patchesByRoot) return table;
+
+        const int oldRows = table->rowCount;
+        const int oldCols = table->columnCount;
+        if (replaceStatstableCsvDefaultAttachments(table, assetName, *patchesByRoot, blueprintPatchCount, lastWrite)) {
+            g_lastGoodTableByAsset[assetKey] = table;
+            log("Overlayed statstable CSV non-optic default attachments for '%s' from '%s' (source %llu rows x %llu cols -> target %d rows x %d cols, table=%p)",
+                assetName.c_str(),
+                blueprintLoose->string().c_str(),
+                static_cast<unsigned long long>(csv->rows.size()),
+                static_cast<unsigned long long>(csv->cols),
+                oldRows,
+                oldCols,
+                static_cast<void*>(table));
+        }
+
+        return table;
+    }
+
+    if (kEnableAttachmentMapCsvScopeRedirect && isAttachmentMapTable(assetName)) {
+        auto blueprintLoose = findLooseAssetFile("mp/classtable_arena_blueprints.csv");
+        if (!blueprintLoose) {
+            static bool loggedMissingBlueprintSource = false;
+            if (!loggedMissingBlueprintSource) {
+                loggedMissingBlueprintSource = true;
+                log("Attachmentmap table '%s' requested, but no loose mp/classtable_arena_blueprints.csv source exists under watched assets roots",
+                    assetName.c_str());
+            }
+            return table;
+        }
+
+        fs::file_time_type lastWrite{};
+        try {
+            lastWrite = fs::last_write_time(*blueprintLoose);
+        } catch (...) {
+            log("Could not read timestamp for blueprint source string_table '%s'", blueprintLoose->string().c_str());
+            return table;
+        }
+
+        auto activeIt = g_active.find(activeKey);
+        if (activeIt != g_active.end() && activeIt->second && activeIt->second->lastWrite == lastWrite && activeIt->second->target == table) {
+            return table;
+        }
+
+        auto csv = parseCsvCached(*blueprintLoose, lastWrite);
+        if (!csv) {
+            log("Failed to parse blueprint source string_table '%s' for attachmentmap CSV scope overlay",
+                blueprintLoose->string().c_str());
+            return table;
+        }
+
+        int blueprintPatchCount = 0;
+        const BlueprintAttachmentMap* patchesByRoot = getBlueprintAttachmentMapCached(*blueprintLoose, lastWrite, *csv, &blueprintPatchCount);
+        if (!patchesByRoot) return table;
+
+        if (replaceAttachmentMapScopeFromBlueprintDefaults(table, assetName, *patchesByRoot, blueprintPatchCount, lastWrite)) {
+            g_lastGoodTableByAsset[assetKey] = table;
+            log("Overlayed attachmentmap CSV scope redirect for '%s' from '%s' (source %llu rows x %llu cols -> target %d rows x %d cols, table=%p)",
+                assetName.c_str(),
+                blueprintLoose->string().c_str(),
+                static_cast<unsigned long long>(csv->rows.size()),
+                static_cast<unsigned long long>(csv->cols),
+                table->rowCount,
+                table->columnCount,
+                static_cast<void*>(table));
+        }
+
+        return table;
+    }
+
+    if (kEnableAttachmentMapScopeRedirect && isAttachmentMapTable(assetName)) {
+        const fs::file_time_type lastWrite = latestT9PrimaryRootSourceWriteTime();
+
+        auto activeIt = g_active.find(activeKey);
+        if (activeIt != g_active.end() && activeIt->second && activeIt->second->lastWrite == lastWrite && activeIt->second->target == table) {
+            return table;
+        }
+
+        if (replaceAttachmentMapScopeWithThermal(table, assetName, lastWrite)) {
+            g_lastGoodTableByAsset[assetKey] = table;
+            log("Overlayed attachmentmap scope-to-thermal redirect for '%s' (target %d rows x %d cols, table=%p)",
+                assetName.c_str(),
+                table->rowCount,
+                table->columnCount,
+                static_cast<void*>(table));
+        }
+
+        return table;
+    }
+
     if (isGunsmithVariantTableName(assetName)) {
         auto blueprintLoose = findLooseAssetFile("mp/classtable_arena_blueprints.csv");
         if (!blueprintLoose) {
@@ -1647,16 +3083,20 @@ StringTable* tryReplaceStringTable(const char* givenName, StringTable* table) {
             return table;
         }
 
-        auto csv = parseCsv(*blueprintLoose);
+        auto csv = parseCsvCached(*blueprintLoose, lastWrite);
         if (!csv) {
             log("Failed to parse blueprint source string_table '%s' for gunsmith variant attachment overlay",
                 blueprintLoose->string().c_str());
             return table;
         }
 
+        int blueprintPatchCount = 0;
+        const BlueprintAttachmentMap* patchesByRoot = getBlueprintAttachmentMapCached(*blueprintLoose, lastWrite, *csv, &blueprintPatchCount);
+        if (!patchesByRoot) return table;
+
         const int oldRows = table->rowCount;
         const int oldCols = table->columnCount;
-        if (replaceGunsmithVariantTable(table, assetName, *csv, lastWrite)) {
+        if (replaceGunsmithVariantTable(table, assetName, *patchesByRoot, blueprintPatchCount, lastWrite)) {
             g_lastGoodTableByAsset[assetKey] = table;
             log("Overlayed gunsmith variant attachments for '%s' from '%s' (source %llu rows x %llu cols -> target %d rows x %d cols, table=%p)",
                 assetName.c_str(),
@@ -1694,7 +3134,7 @@ StringTable* tryReplaceStringTable(const char* givenName, StringTable* table) {
         return table; // Already patched this exact table instance with this exact file version.
     }
 
-    auto csv = parseCsv(*loose);
+    auto csv = parseCsvCached(*loose, lastWrite);
     if (!csv) {
         log("Failed to parse loose string_table '%s'", loose->string().c_str());
         return table;
@@ -1940,8 +3380,8 @@ bool installHook() {
     VirtualProtect(target, sizeof(patch), oldProtect, &ignored);
 
     log("Target first 16 bytes after hook: %s", firstBytesHex(target, 16).c_str());
-    log("OVERLAY_CYCLIC_EXPANDED_POOL_OSP_BLUEPRINT_GUNSMITH_ATTACH_TAKEFISTS_MEMPATCH_BUILD_ID 2026-06-25");
-    log("5-byte near-stub chain hook installed successfully. Arena classTables, mp/arenaGGWeapons(.csv/.alt), and matching mp/gunsmith/*_variants.csv attachment cells can be overlay-patched.");
+    log("%s", kBuildId);
+    log("5-byte near-stub chain hook installed successfully. Arena classtables, mp/arenaggweapons.csv, and matching mp/gunsmith/*_variants.csv attachment cells can be overlay-patched.");
     return true;
 }
 
@@ -1980,18 +3420,23 @@ DWORD WINAPI workerThread(LPVOID) {
         log("Watching assets root: %s", narrow(root.wstring()).c_str());
     }
 
-    log("Overlay/cyclic expanded-pool-index + OSP Blueprints full-sniper/gunsmith-attachment mode enabled. ClassTables, arenaGGWeapons/alt, and matching gunsmith variants can be overlay-patched.");
+    log("Overlay/cyclic expanded-pool-index + OSP Blueprints classtable/gunsmith-attachment mode enabled. Classtables, arenaggweapons, and matching gunsmith variants can be overlay-patched.");
     log("Target string_table: mp/classtable_arena.csv");
     log("Target string_table: mp/classtable_arena_alt.csv");
     log("Target string_table: mp/classtable_arena_blueprints.csv");
-    log("Target string_table: mp/arenaGGWeapons.csv");
-    log("Target string_table: mp/arenaGGWeapons_alt.csv");
+    log("Target string_table: mp/arenaggweapons.csv");
+    log("Target string_table: mp/statstable.csv (non-optic default attachments sourced from mp/classtable_arena_blueprints.csv)");
+    log("Target string_table: mp/attachmentmap.csv (scope cells redirected from CSV-selected optic per weapon root)");
     log("Target string_table pattern: mp/gunsmith/*_variants.csv (attachments synthesized from mp/classtable_arena_blueprints.csv)");
 
     // Let iw8-mod finish its startup hooks if this is injected very early.
     Sleep(1500);
 
-    installFileProbeHooks();
+    if (kEnableFileProbeHooks) {
+        installFileProbeHooks();
+    } else {
+        log("File probe hooks disabled for performance build");
+    }
 
     g_hookInstalled = installHook();
     g_hookInstallFailed = !g_hookInstalled;
